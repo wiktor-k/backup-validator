@@ -1,3 +1,6 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 use std::{
     io::{ErrorKind, Read},
     slice::Iter,
@@ -24,6 +27,9 @@ fn get_field(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
     Ok(field)
 }
 
+/// Parsed backup.
+///
+/// This object contains backup which is well-formed and has been parsed.
 #[derive(Debug)]
 pub struct Backup {
     salt: Vec<u8>,
@@ -33,28 +39,29 @@ pub struct Backup {
 }
 
 impl Backup {
-    pub fn parse(mut r: impl Read) -> std::io::Result<Self> {
+    /// Parse the backup from a reader.
+    pub fn parse(mut reader: impl Read) -> std::io::Result<Self> {
         let mut magic = [0; MAGIC.len()];
-        r.read_exact(&mut magic)?;
+        reader.read_exact(&mut magic)?;
         assert_eq!(MAGIC, magic, "Data does not contain a NetHSM header");
         let mut version = [0; 1];
-        r.read_exact(&mut version)?;
+        reader.read_exact(&mut version)?;
         assert_eq!(
             version[0], 0,
             "Version mismatch on export, provided backup version is {}, this tool expects 0",
             version[0],
         );
 
-        let salt = get_field(&mut r)?;
-        let encrypted_version = get_field(&mut r)?;
-        let encrypted_domain_key = get_field(&mut r)?;
+        let salt = get_field(&mut reader)?;
+        let encrypted_version = get_field(&mut reader)?;
+        let encrypted_domain_key = get_field(&mut reader)?;
 
         let mut items = vec![];
         loop {
-            match get_length(&mut r) {
+            match get_length(&mut reader) {
                 Ok(len) => {
                     let mut field = vec![0; len];
-                    r.read_exact(&mut field)?;
+                    reader.read_exact(&mut field)?;
                     items.push(field);
                 }
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
@@ -73,15 +80,21 @@ impl Backup {
             items,
         })
     }
+
+    /// Try to decrypt the backup using provided password.
+    pub fn decrypt(&self, password: &[u8]) -> Result<BackupDecryptor> {
+        BackupDecryptor::new(self, password)
+    }
 }
 
+/// Backup decryptor which decrypts backup items on the fly.
 pub struct BackupDecryptor<'a> {
     backup: &'a Backup,
     cipher: Aes256Gcm,
 }
 
 impl<'a> BackupDecryptor<'a> {
-    pub fn new(backup: &'a Backup, password: &[u8]) -> testresult::TestResult<Self> {
+    fn new(backup: &'a Backup, password: &[u8]) -> Result<Self> {
         let mut key = [0; 32];
         scrypt(
             password,
@@ -94,7 +107,7 @@ impl<'a> BackupDecryptor<'a> {
         Ok(Self { backup, cipher })
     }
 
-    pub fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let (nonce, msg) = bytes.split_at(12);
 
         let payload = aes_gcm::aead::Payload { msg, aad };
@@ -103,14 +116,17 @@ impl<'a> BackupDecryptor<'a> {
         Ok(decrypted)
     }
 
+    /// Decrypted backup version.
     pub fn version(&self) -> Result<Vec<u8>> {
         self.decrypt(&self.backup.encrypted_version, b"backup-version")
     }
 
+    /// Decrypted domain key.
     pub fn domain_key(&self) -> Result<Vec<u8>> {
         self.decrypt(&self.backup.encrypted_domain_key, b"domain-key")
     }
 
+    /// Returns an iterator over backup entries.
     pub fn items_iter(&'a self) -> impl Iterator<Item = Result<(String, Vec<u8>)>> + 'a {
         BackupItemDecryptor {
             decryptor: self,
@@ -157,15 +173,12 @@ mod tests {
 
         let backup = Backup::parse(backup)?;
 
-        let decryptor = BackupDecryptor::new(&backup, pwd)?;
+        let decryptor = backup.decrypt(pwd)?;
 
-        let version = decryptor.version()?;
+        assert_eq!(decryptor.version()?, [0]);
 
-        assert_eq!(version, [0]);
-
-        let domain_key = decryptor.domain_key()?;
         assert_eq!(
-            domain_key,
+            decryptor.domain_key()?,
             [
                 76, 254, 52, 164, 253, 191, 82, 135, 7, 229, 226, 14, 247, 246, 29, 71, 205, 151,
                 210, 204, 201, 50, 58, 12, 39, 94, 79, 53, 134, 148, 211, 193, 22, 176, 22, 30, 60,
