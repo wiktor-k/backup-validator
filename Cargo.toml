@@ -1,0 +1,9 @@
+[package]
+name = "backup-validator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10.3"
+scrypt = "0.11.0"
+testresult = "0.4.1"
