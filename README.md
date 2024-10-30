@@ -9,9 +9,8 @@ Small library and a CLI utility to validate and browse NetHSM backups.
 use std::collections::HashMap;
 use nethsm_backup::Backup;
 
-let backup = std::fs::File::open("tests/nethsm.backup-file.bkp")?;
-
-let decryptor = Backup::parse(backup)?.decrypt(b"my-very-unsafe-backup-passphrase")?;
+let backup = Backup::parse(std::fs::File::open("tests/nethsm.backup-file.bkp")?)?;
+let decryptor = backup.decrypt(b"my-very-unsafe-backup-passphrase")?;
 
 assert_eq!(decryptor.version()?, [0]);
 
