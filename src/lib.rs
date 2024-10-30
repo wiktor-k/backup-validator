@@ -1,4 +1,3 @@
-use scrypt::{scrypt, Params};
 use std::io::{ErrorKind, Read};
 use testresult::TestResult;
 
@@ -40,17 +39,13 @@ pub fn validate(mut r: impl Read) -> std::io::Result<Backup> {
         "Version mismatch on export, provided backup version is {}, this tool expects 0",
         version[0],
     );
-    //eprintln!("reading salt");
 
     let salt = get_field(&mut r)?;
-    //eprintln!("reading enc: ({}) {salt:?}", salt.len());
     let encrypted_version = get_field(&mut r)?;
-    //eprintln!("reading enc_dk");
     let encrypted_domain_key = get_field(&mut r)?;
 
     let mut items = vec![];
     loop {
-        //eprintln!("reading data");
         match get_length(&mut r) {
             Ok(len) => {
                 let mut field = vec![0; len];
@@ -74,30 +69,24 @@ pub fn validate(mut r: impl Read) -> std::io::Result<Backup> {
     })
 }
 
-use aes_gcm::{
-    aead::{Aead, AeadCore, AeadMut, KeyInit, OsRng},
-    Aes256Gcm,
-    Key, // Or `Aes128Gcm`
-    Nonce,
-};
+use aes_gcm::aead::Aead;
 
-pub fn decrypt(pwd: &[u8], backup: Backup) -> TestResult<Vec<Vec<u8>>> {
-    let mut key = [0; 32];
-    eprintln!("getting key");
-    scrypt(&pwd, &backup.salt, &Params::new(14, 8, 16, 32)?, &mut key)?;
-    eprintln!("got key");
-    let key: &Key<Aes256Gcm> = &key.into();
-    let cipher = Aes256Gcm::new(&key);
-    let mut decrypted = vec![];
-    for item in backup.items.iter() {
-        decrypted.push(cipher.decrypt((&item[0..12]).try_into()?, &item[12..])?);
-    }
+pub fn decrypt(cipher: &impl Aead, bytes: &[u8], aad: &[u8]) -> TestResult<Vec<u8>> {
+    let (nonce, msg) = bytes.split_at(12);
+
+    let payload = aes_gcm::aead::Payload { msg, aad };
+
+    let decrypted = cipher.decrypt(nonce.into(), payload)?;
     Ok(decrypted)
-    //
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use aes_gcm::{Aes256Gcm, Key, KeyInit as _};
+    use scrypt::{scrypt, Params};
+
     use super::*;
 
     #[test]
@@ -118,16 +107,33 @@ mod tests {
         );
         let key: &Key<Aes256Gcm> = &key.into();
         let cipher = Aes256Gcm::new(&key);
-        let (nonce, msg) = backup.encrypted_version.split_at(12);
+        let version = decrypt(&cipher, &backup.encrypted_version, b"backup-version")?;
 
-        let payload = aes_gcm::aead::Payload {
-            msg,
-            aad: b"backup-version",
-        };
+        assert_eq!(version, [0]);
 
-        let decrypted = cipher.decrypt(nonce.into(), payload)?;
+        let domain_key = decrypt(&cipher, &backup.encrypted_domain_key, b"domain-key")?;
+        assert_eq!(
+            domain_key,
+            [
+                76, 254, 52, 164, 253, 191, 82, 135, 7, 229, 226, 14, 247, 246, 29, 71, 205, 151,
+                210, 204, 201, 50, 58, 12, 39, 94, 79, 53, 134, 148, 211, 193, 22, 176, 22, 30, 60,
+                17, 56, 9, 28, 225, 0, 186, 149, 103, 197, 117, 133, 245, 199, 136, 85, 64, 255,
+                111, 170, 137, 158, 184
+            ]
+        );
 
-        assert_eq!(decrypted, [0]);
+        let mut map = HashMap::new();
+        for item in backup.items {
+            let decrypted = decrypt(&cipher, &item, b"backup")?;
+            let mut c = std::io::Cursor::new(decrypted);
+            let k = get_field(&mut c)?;
+            let mut v = vec![];
+            c.read_to_end(&mut v)?;
+            map.insert(String::from_utf8(k)?, v);
+        }
+        assert_eq!(map.len(), 46);
+        assert_eq!(map.get("/config/unattended-boot"), Some(vec![49].as_ref()));
+        assert_eq!(map.get("/config/version"), Some(vec![48].as_ref()));
 
         Ok(())
     }
