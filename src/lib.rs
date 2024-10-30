@@ -2,7 +2,8 @@ use std::{
     io::{ErrorKind, Read},
     slice::Iter,
 };
-use testresult::TestResult;
+
+type Result<T> = testresult::TestResult<T>;
 
 const MAGIC: &[u8] = b"_NETHSM_BACKUP_";
 
@@ -93,7 +94,7 @@ impl<'a> BackupDecryptor<'a> {
         Ok(Self { backup, cipher })
     }
 
-    pub fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> TestResult<Vec<u8>> {
+    pub fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let (nonce, msg) = bytes.split_at(12);
 
         let payload = aes_gcm::aead::Payload { msg, aad };
@@ -102,15 +103,15 @@ impl<'a> BackupDecryptor<'a> {
         Ok(decrypted)
     }
 
-    pub fn version(&self) -> TestResult<Vec<u8>> {
+    pub fn version(&self) -> Result<Vec<u8>> {
         self.decrypt(&self.backup.encrypted_version, b"backup-version")
     }
 
-    pub fn domain_key(&self) -> TestResult<Vec<u8>> {
+    pub fn domain_key(&self) -> Result<Vec<u8>> {
         self.decrypt(&self.backup.encrypted_domain_key, b"domain-key")
     }
 
-    pub fn items_iter(&'a self) -> impl Iterator<Item = TestResult<(String, Vec<u8>)>> + 'a {
+    pub fn items_iter(&'a self) -> impl Iterator<Item = Result<(String, Vec<u8>)>> + 'a {
         BackupItemDecryptor {
             decryptor: self,
             inner: self.backup.items.iter(),
@@ -124,7 +125,7 @@ struct BackupItemDecryptor<'a> {
 }
 
 impl<'a> Iterator for BackupItemDecryptor<'a> {
-    type Item = TestResult<(String, Vec<u8>)>;
+    type Item = Result<(String, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|item| {
@@ -150,7 +151,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn import_backup() -> testresult::TestResult {
+    fn parse_and_decrypt_backup() -> testresult::TestResult {
         let backup = std::fs::File::open("tests/nethsm.backup-file.bkp")?;
         let pwd = b"my-very-unsafe-backup-passphrase";
 
@@ -173,12 +174,10 @@ mod tests {
             ]
         );
 
-        let map = decryptor
-            .items_iter()
-            .collect::<TestResult<HashMap<_, _>>>()?;
+        let map = decryptor.items_iter().collect::<Result<HashMap<_, _>>>()?;
         assert_eq!(map.len(), 46);
-        assert_eq!(map.get("/config/unattended-boot"), Some(vec![49].as_ref()));
-        assert_eq!(map.get("/config/version"), Some(vec![48].as_ref()));
+        assert_eq!(map["/config/unattended-boot"], vec![49]);
+        assert_eq!(map["/config/version"], vec![48]);
 
         Ok(())
     }
