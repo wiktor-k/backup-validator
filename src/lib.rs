@@ -1,4 +1,7 @@
-use std::io::{ErrorKind, Read};
+use std::{
+    io::{ErrorKind, Read},
+    slice::Iter,
+};
 use testresult::TestResult;
 
 const MAGIC: &[u8] = b"_NETHSM_BACKUP_";
@@ -28,64 +31,121 @@ pub struct Backup {
     items: Vec<Vec<u8>>,
 }
 
-pub fn validate(mut r: impl Read) -> std::io::Result<Backup> {
-    let mut magic = [0; MAGIC.len()];
-    r.read_exact(&mut magic)?;
-    assert_eq!(MAGIC, magic, "Data does not contain a NetHSM header");
-    let mut version = [0; 1];
-    r.read_exact(&mut version)?;
-    assert_eq!(
-        version[0], 0,
-        "Version mismatch on export, provided backup version is {}, this tool expects 0",
-        version[0],
-    );
+impl Backup {
+    pub fn parse(mut r: impl Read) -> std::io::Result<Self> {
+        let mut magic = [0; MAGIC.len()];
+        r.read_exact(&mut magic)?;
+        assert_eq!(MAGIC, magic, "Data does not contain a NetHSM header");
+        let mut version = [0; 1];
+        r.read_exact(&mut version)?;
+        assert_eq!(
+            version[0], 0,
+            "Version mismatch on export, provided backup version is {}, this tool expects 0",
+            version[0],
+        );
 
-    let salt = get_field(&mut r)?;
-    let encrypted_version = get_field(&mut r)?;
-    let encrypted_domain_key = get_field(&mut r)?;
+        let salt = get_field(&mut r)?;
+        let encrypted_version = get_field(&mut r)?;
+        let encrypted_domain_key = get_field(&mut r)?;
 
-    let mut items = vec![];
-    loop {
-        match get_length(&mut r) {
-            Ok(len) => {
-                let mut field = vec![0; len];
-                r.read_exact(&mut field)?;
-                items.push(field);
-            }
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                break;
-            }
-            Err(error) => {
-                return Err(error);
+        let mut items = vec![];
+        loop {
+            match get_length(&mut r) {
+                Ok(len) => {
+                    let mut field = vec![0; len];
+                    r.read_exact(&mut field)?;
+                    items.push(field);
+                }
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(error) => {
+                    return Err(error);
+                }
             }
         }
+
+        Ok(Self {
+            salt,
+            encrypted_version,
+            encrypted_domain_key,
+            items,
+        })
+    }
+}
+
+pub struct BackupDecryptor<'a> {
+    backup: &'a Backup,
+    cipher: Aes256Gcm,
+}
+
+impl<'a> BackupDecryptor<'a> {
+    pub fn new(backup: &'a Backup, password: &[u8]) -> testresult::TestResult<Self> {
+        let mut key = [0; 32];
+        scrypt(
+            password,
+            &backup.salt,
+            &Params::new(14, 8, 16, 32)?,
+            &mut key,
+        )?;
+        let key: &Key<Aes256Gcm> = &key.into();
+        let cipher = Aes256Gcm::new(&key);
+        Ok(Self { backup, cipher })
     }
 
-    Ok(Backup {
-        salt,
-        encrypted_version,
-        encrypted_domain_key,
-        items,
-    })
+    pub fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> TestResult<Vec<u8>> {
+        let (nonce, msg) = bytes.split_at(12);
+
+        let payload = aes_gcm::aead::Payload { msg, aad };
+
+        let decrypted = self.cipher.decrypt(nonce.into(), payload)?;
+        Ok(decrypted)
+    }
+
+    pub fn version(&self) -> TestResult<Vec<u8>> {
+        self.decrypt(&self.backup.encrypted_version, b"backup-version")
+    }
+
+    pub fn domain_key(&self) -> TestResult<Vec<u8>> {
+        self.decrypt(&self.backup.encrypted_domain_key, b"domain-key")
+    }
+
+    pub fn items_iter(&'a self) -> impl Iterator<Item = TestResult<(String, Vec<u8>)>> + 'a {
+        BackupItemDecryptor {
+            decryptor: self,
+            inner: self.backup.items.iter(),
+        }
+    }
 }
+
+struct BackupItemDecryptor<'a> {
+    decryptor: &'a BackupDecryptor<'a>,
+    inner: Iter<'a, Vec<u8>>,
+}
+
+impl<'a> Iterator for BackupItemDecryptor<'a> {
+    type Item = TestResult<(String, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|item| {
+            let decrypted = self.decryptor.decrypt(&item, b"backup")?;
+            let mut c = std::io::Cursor::new(decrypted);
+            let k = get_field(&mut c)?;
+            let mut v = vec![];
+            c.read_to_end(&mut v)?;
+            Ok((String::from_utf8(k)?, v))
+        })
+    }
+}
+
+use aes_gcm::{Aes256Gcm, Key, KeyInit as _};
+use scrypt::{scrypt, Params};
 
 use aes_gcm::aead::Aead;
-
-pub fn decrypt(cipher: &impl Aead, bytes: &[u8], aad: &[u8]) -> TestResult<Vec<u8>> {
-    let (nonce, msg) = bytes.split_at(12);
-
-    let payload = aes_gcm::aead::Payload { msg, aad };
-
-    let decrypted = cipher.decrypt(nonce.into(), payload)?;
-    Ok(decrypted)
-}
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-
-    use aes_gcm::{Aes256Gcm, Key, KeyInit as _};
-    use scrypt::{scrypt, Params};
 
     use super::*;
 
@@ -94,24 +154,15 @@ mod tests {
         let backup = std::fs::File::open("tests/nethsm.backup-file.bkp")?;
         let pwd = b"my-very-unsafe-backup-passphrase";
 
-        let backup = validate(backup)?;
+        let backup = Backup::parse(backup)?;
 
-        let mut key = [0; 32];
-        scrypt(pwd, &backup.salt, &Params::new(14, 8, 16, 32)?, &mut key)?;
-        assert_eq!(
-            key,
-            [
-                16, 217, 215, 157, 193, 236, 87, 25, 83, 202, 109, 132, 66, 139, 7, 7, 186, 224,
-                163, 117, 87, 186, 210, 36, 254, 200, 148, 170, 245, 248, 130, 158
-            ]
-        );
-        let key: &Key<Aes256Gcm> = &key.into();
-        let cipher = Aes256Gcm::new(&key);
-        let version = decrypt(&cipher, &backup.encrypted_version, b"backup-version")?;
+        let decryptor = BackupDecryptor::new(&backup, pwd)?;
+
+        let version = decryptor.version()?;
 
         assert_eq!(version, [0]);
 
-        let domain_key = decrypt(&cipher, &backup.encrypted_domain_key, b"domain-key")?;
+        let domain_key = decryptor.domain_key()?;
         assert_eq!(
             domain_key,
             [
@@ -122,15 +173,9 @@ mod tests {
             ]
         );
 
-        let mut map = HashMap::new();
-        for item in backup.items {
-            let decrypted = decrypt(&cipher, &item, b"backup")?;
-            let mut c = std::io::Cursor::new(decrypted);
-            let k = get_field(&mut c)?;
-            let mut v = vec![];
-            c.read_to_end(&mut v)?;
-            map.insert(String::from_utf8(k)?, v);
-        }
+        let map = decryptor
+            .items_iter()
+            .collect::<TestResult<HashMap<_, _>>>()?;
         assert_eq!(map.len(), 46);
         assert_eq!(map.get("/config/unattended-boot"), Some(vec![49].as_ref()));
         assert_eq!(map.get("/config/version"), Some(vec![48].as_ref()));
